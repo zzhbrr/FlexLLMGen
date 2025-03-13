@@ -7,11 +7,15 @@ import queue
 import shutil
 import time
 import threading
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, List
 
 import torch
 import torch.nn.functional as F
 import numpy as np
+
+from transformers.models.mixtral.modeling_mixtral import MixtralRotaryEmbedding
+from transformers.models.mixtral.modeling_mixtral import apply_rotary_pos_emb, repeat_kv
+from transformers.models.mixtral.configuration_mixtral import MixtralConfig
 
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
@@ -235,7 +239,27 @@ class TorchDevice:
              torch.ones((bs, 1), dtype=attention_mask.dtype, device=self.dev)), dim=1)
         if donate[0]: attention_mask.delete()
         return TorchTensor.create_from_torch(data, self)
+    
+    def mixtral_input_embed(self, inputs, attention_mask, w_token, rotary_emb: MixtralRotaryEmbedding, pad_token_id, donate):
+        # decompress weights
+        if w_token.device.device_type == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+        token_ids = inputs.data
+        mask = attention_mask.data
+        if donate[0]: inputs.delete()
 
+        # pos embedding
+        positions = torch.cumsum(mask, dim=1).int() * mask + 1
+
+        # cut positions if `past_key_values_length` is > 0
+        past_key_values_length = mask.shape[1] - token_ids.shape[1] # TODO: 推测解码的时候这里需要改
+        positions = positions[:, past_key_values_length:]
+
+        token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
+        position_embed = rotary_emb(token_embed, positions)
+        position_embed = torch.stack(position_embed, dim=0)
+        return TorchTensor.create_from_torch(token_embed, self), TorchTensor.create_from_torch(position_embed, self)
+    
     def opt_input_embed(self, inputs, attention_mask, w_token, w_pos, pad_token_id, donate):
         # decompress weights
         if w_token.device.device_type == DeviceType.COMPRESSED:
@@ -262,6 +286,31 @@ class TorchDevice:
         data = token_embed + pos_embed
         return TorchTensor.create_from_torch(data, self)
 
+    def mixtral_output_embed(self, inputs, w_ln, w_token, donate,
+                         do_sample, temperature, eps=1e-6):
+        # decompress weights
+        if w_token.device.device_type == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+
+        b, s, h = inputs.data.shape
+
+        # MixtralRMSNorm
+        variance = inputs.data.pow(2).mean(-1, keepdim=True)
+        hidden = inputs.data * torch.rsqrt(variance + eps)
+        hidden = hidden * w_ln.data
+        if donate[0]: inputs.delete()
+
+        # output embedding
+        logits = F.linear(hidden, w_token.data.T)
+        last_token_logits = logits[:,-1,:]
+
+        if do_sample and not temperature < 1e-5:
+            probs = torch.softmax(last_token_logits / temperature, dim=-1)
+            ids = torch.multinomial(probs, num_samples=1)
+        else:
+            ids = last_token_logits.argmax(dim=1, keepdim=True)
+        return TorchTensor.create_from_torch(ids, self)
+
     def opt_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
                          do_sample, temperature):
         # decompress weights
@@ -285,15 +334,166 @@ class TorchDevice:
         return TorchTensor.create_from_torch(ids, self)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
-        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+        num_key_value_heads, head_dim, prompt_len, gen_len, gpu_batch_size = (
+            config.num_key_value_heads, config.head_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        h_kv = num_key_value_heads * head_dim
+        # shape = (prompt_len + gen_len - 1, gpu_batch_size * num_key_value_heads, head_dim)
+        shape = (gpu_batch_size, num_key_value_heads, prompt_len + gen_len - 1, head_dim)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         return k_cache, v_cache
+    
+    def MixtralAttention_Prefill(self, inputs, position_embeddings, attention_mask, w_q, w_k, w_v, w_out, w_ln, donate, compress_cache, comp_config, config: MixtralConfig):
+        # decompress weights
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
+        
+        b, s, h = inputs.shape
+        head_dim, n_head, n_kv_head = config.head_dim, config.num_attention_heads, config.num_key_value_heads
+        scaling = head_dim ** -0.5
+
+        # MixtralRMSNorm
+        variance = inputs.data.pow(2).mean(-1, keepdim=True)
+        hidden = inputs.data * torch.rsqrt(variance + config.rms_norm_eps)
+        hidden = hidden * w_ln.data
+        
+        hidden_shape = (b, s, -1, head_dim)
+        
+        query_states = F.linear(hidden, w_q.data.T).view(hidden_shape).transpose(1, 2) # (b, n_head, s, head_dim)
+        key_states = F.linear(hidden, w_k.data.T).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, s, head_dim)
+        value_states = F.linear(hidden, w_v.data.T).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, s, head_dim)
+        
+
+        cos, sin = torch.chunk(position_embeddings.data, 2, dim=0)
+        cos = cos.squeeze(0)
+        sin = sin.squeeze(0)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # eager attention forward
+        key = repeat_kv(key_states, config.num_attention_heads // config.num_key_value_heads)
+        value = repeat_kv(value_states, config.num_attention_heads // config.num_key_value_heads)
+
+        attn_weights = torch.matmul(query_states, key.transpose(2, 3)) * scaling
+        
+        idx = torch.arange(s, device=self.dev)
+        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
+        mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
+        # shape: (b, n_head, s, s)
+        attn_weights = torch.where(mask, attn_weights, -1e4)
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=config.attention_dropout, training=False)
+        attn_output = torch.matmul(attn_weights, value)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        attn_output = attn_output.reshape(b, s, h).contiguous()
+        attn_output = F.linear(attn_output, w_out.data.T)
+
+        # key_states = key_states.reshape(b*n_kv_head, s, head_dim).transpose(0, 1) # (b*n_kv_head, s, head_dim)
+        # value_states = value_states.reshape(b*n_kv_head, s, head_dim).transpose(0, 1) # (b*n_kv_head, s, head_dim)
+
+        if compress_cache:
+            key_states = self.compressed_device.compress(key_states, comp_config)
+            value_states = self.compressed_device.compress(value_states, comp_config)
+        else:
+            key_states = TorchTensor.create_from_torch(key_states, self)
+            value_states = TorchTensor.create_from_torch(value_states, self)
+        
+        attn_output.add_(inputs.data)
+
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
+
+        return TorchTensor.create_from_torch(attn_output, self), key_states, value_states
+
+    
+    def MixtralAttention_Decode(self, inputs, position_embeddings, attention_mask, w_q, w_k, w_v, w_out, w_ln, donate, attn_sparsity, compress_cache, comp_config, config: MixtralConfig, k_cache, v_cache):
+        # decompress weights
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
+        
+        b, s, h = inputs.shape # s = 1
+        head_dim, n_head, n_kv_head = config.head_dim, config.num_attention_heads, config.num_key_value_heads
+        scaling = head_dim ** -0.5
+        
+        # MixtralRMSNorm
+        variance = inputs.data.pow(2).mean(-1, keepdim=True)
+        hidden = inputs.data * torch.rsqrt(variance + config.rms_norm_eps)
+        hidden = hidden * w_ln.data
+        
+        hidden_shape = (b, s, -1, head_dim)
+        
+        query_states = F.linear(hidden, w_q.data.T).view(hidden_shape).transpose(1, 2) # (b, n_head, 1, head_dim)
+        key_states = F.linear(hidden, w_k.data.T).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, 1, head_dim)
+        value_states = F.linear(hidden, w_v.data.T).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, 1, head_dim)
+
+        cos, sin = torch.chunk(position_embeddings.data, 2, dim=0)
+        cos = cos.squeeze(0)
+        sin = sin.squeeze(0)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    
+        src_s = attention_mask.shape[1]
+        tgt_s = s
+        
+        if isinstance(k_cache, TorchTensor):
+            assert attn_sparsity >= 1.0
+            if attn_sparsity >= 1.0:  # Dense attention
+                if compress_cache:
+                    # shape: (b, n_kv_head, s, head_dim)
+                    k = k_cache.device.decompress(k_cache)[:src_s]
+                    v = v_cache.device.decompress(v_cache)[:src_s]
+                else:
+                    # shape: (b, n_kv_head, s, head_dim)
+                    k = k_cache.data[:, :, :src_s, :]
+                    v = v_cache.data[:, :, :src_s, :]
+                k[:, :, src_s - 1:src_s, :] = key_states
+                v[:, :, src_s - 1:src_s, :] = value_states
+
+                # eager attention forward
+                key = repeat_kv(k, config.num_attention_heads // config.num_key_value_heads)
+                value = repeat_kv(v, config.num_attention_heads // config.num_key_value_heads)
+
+                attn_weights = torch.matmul(query_states, key.transpose(2, 3)) * scaling
+
+                mask = attention_mask.data.view(b, 1, 1, src_s)
+                # shape: (b, n_head, 1, s)
+                attn_weights = torch.where(mask, attn_weights, -1e4)
+
+                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                attn_weights = F.dropout(attn_weights, p=config.attention_dropout, training=False)
+                attn_output = torch.matmul(attn_weights, value)
+                attn_output = attn_output.transpose(1, 2).contiguous()
+
+                attn_output = attn_output.reshape(b, s, h).contiguous()
+                attn_output = F.linear(attn_output, w_out.data.T)
+
+        else:  # Mixed device attention
+            assert(False)
+
+        if compress_cache:
+            key_states = self.compressed_device.compress(key_states, comp_config)
+            value_states = self.compressed_device.compress(value_states, comp_config)
+        else:
+            key_states = TorchTensor.create_from_torch(key_states, self)
+            value_states = TorchTensor.create_from_torch(value_states, self)
+        
+        attn_output.add_(inputs.data)
+
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
+
+        return TorchTensor.create_from_torch(attn_output, self), key_states, value_states
+
+
 
     def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
@@ -565,6 +765,68 @@ class TorchDevice:
 
         value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
         return value
+    
+    def mixtral_gate(self, inputs, w_gate, w_ln, donate, config: MixtralConfig):
+        b, s, h = inputs.shape
+        # MixtralRMSNorm
+        variance = inputs.data.pow(2).mean(-1, keepdim=True)
+        hidden = inputs.data * torch.rsqrt(variance + config.rms_norm_eps)
+        hidden = hidden * w_ln.data
+
+        after_norm = hidden
+
+        hidden = hidden.view(-1, config.hidden_size)
+        routing_logits = F.linear(hidden, w_gate.data.T) # (b * s, num_experts)
+
+        if donate[0]: inputs.delete()
+
+        return TorchTensor.create_from_torch(after_norm, self), TorchTensor.create_from_torch(routing_logits, self)
+    
+    def mixtral_moe(self, inputs, routing_logits, pre_norm, topk, num_experts, w1: List[TorchTensor], w2: List[TorchTensor], w3: List[TorchTensor], donate):
+        b, s, h = inputs.shape
+
+        # 计算expert activation
+        routing_weights = F.softmax(routing_logits.data, dim=1, dtype=torch.float) # (b * s, num_experts)
+        routing_weights, selected_experts = torch.topk(routing_weights, topk, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        final_hidden_states = torch.zeros(
+            [b * s, h], dtype=inputs.dtype, device=torch.device("cuda:0")
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(num_experts):
+            w1_expert = w1[expert_idx].data
+            w2_expert = w2[expert_idx].data
+            w3_expert = w3[expert_idx].data
+            idx, top_x = torch.where(expert_mask[expert_idx])
+
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = inputs.data.view(-1, h)[None, top_x].reshape(-1, h)
+
+            # 计算 expert
+            current_hidden_states = F.silu(F.linear(current_state, w1_expert.T)) * F.linear(current_state, w2_expert.T)
+            current_hidden_states = F.linear(current_hidden_states, w3_expert.T)
+            current_hidden_states = current_hidden_states * routing_weights[top_x, idx, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(inputs.dtype))
+        final_hidden_states = final_hidden_states.reshape(b, s, h)
+        final_hidden_states += pre_norm.data
+        inputs.delete()
+        pre_norm.delete()
+        routing_logits.delete()
+        return TorchTensor.create_from_torch(final_hidden_states, self)
+
+        
+
+
 
     def mlp(self, inputs, wi, bi, wo, bo, w_ln, b_ln, donate):
         # decompress weights
@@ -665,10 +927,12 @@ class TorchDisk:
             os.remove(tensor.data)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
-        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+        num_key_value_heads, head_dim, prompt_len, gen_len, gpu_batch_size = (
+            config.num_key_value_heads, config.head_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        h_kv = num_key_value_heads * head_dim
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_key_value_heads, head_dim)
+        shape = (gpu_batch_size, num_key_value_heads, prompt_len + gen_len - 1, head_dim)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
