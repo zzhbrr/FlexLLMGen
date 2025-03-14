@@ -12,6 +12,7 @@ from typing import Union, List, Optional
 
 import numpy as np
 import torch
+import json
 from transformers import AutoTokenizer
 
 from flexllmgen.compression import CompressionConfig
@@ -56,10 +57,18 @@ def get_filename(args):
 
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
-    prompts = ["Paris is the capital city of"]
+    with open('/home/zzh/llmserving/FlexLLMGen/flexllmgen/datasets/mtbench/question.jsonl', 'r') as file:
+        prompts = []
+        for i, line in enumerate(file):
+            if i >= num_prompts:
+                break
+            item = json.loads(line)
+            prompts.append(item["turns"][0])
+    print(prompts)
+    # prompts = ["Paris is the capital city of"]
     input_ids = tokenizer(prompts, padding="max_length",
-                          max_length=prompt_len).input_ids
-    return (input_ids[0],) * num_prompts
+                          max_length=prompt_len, truncation=True).input_ids
+    return input_ids
 
 def calc_model_cache_hidden_size(config: MixtralConfig, model_name, batch_size, seq_len):
     # model size
@@ -115,7 +124,7 @@ def run_flexllmgen(args):
     # mixtral_config.intermediate_size = 512
     # mixtral_config.num_attention_heads = 8
     # mixtral_config.num_key_value_heads = 4
-    # mixtral_config.num_hidden_layers = 12
+    # mixtral_config.num_hidden_layers = 4
     # mixtral_config.hidden_size = 128
     model_size, cache_size, hidden_size = calc_model_cache_hidden_size(mixtral_config, args.model, num_prompts, prompt_len + gen_len)
     print(f"model size: {model_size/GB:.3f} GB, "
@@ -181,9 +190,9 @@ def run_flexllmgen(args):
 
 
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
+    parser.add_argument("--model", type=str, default="mixtralai/Mixtral-8x7B-Instruct-v0.1",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="~/opt_weights",
+    parser.add_argument("--path", type=str, default="/data1/zzh/flexgen_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="~/flexllmgen_offload_dir",

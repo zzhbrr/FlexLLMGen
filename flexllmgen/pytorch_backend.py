@@ -249,7 +249,7 @@ class TorchDevice:
         if donate[0]: inputs.delete()
 
         # pos embedding
-        positions = torch.cumsum(mask, dim=1).int() * mask + 1
+        positions = torch.maximum(torch.cumsum(mask, dim=1).int() * mask - 1, torch.tensor(0, device=mask.device))
 
         # cut positions if `past_key_values_length` is > 0
         past_key_values_length = mask.shape[1] - token_ids.shape[1] # TODO: 推测解码的时候这里需要改
@@ -301,7 +301,7 @@ class TorchDevice:
         if donate[0]: inputs.delete()
 
         # output embedding
-        logits = F.linear(hidden, w_token.data.T)
+        logits = F.linear(hidden, w_token.data)
         last_token_logits = logits[:,-1,:]
 
         if do_sample and not temperature < 1e-5:
@@ -359,15 +359,18 @@ class TorchDevice:
         scaling = head_dim ** -0.5
 
         # MixtralRMSNorm
+        inputs.data = inputs.data.to(torch.float32)
         variance = inputs.data.pow(2).mean(-1, keepdim=True)
         hidden = inputs.data * torch.rsqrt(variance + config.rms_norm_eps)
         hidden = hidden * w_ln.data
+        hidden = hidden.to(torch.float16)
+        inputs.data = inputs.data.to(torch.float16)
         
         hidden_shape = (b, s, -1, head_dim)
         
-        query_states = F.linear(hidden, w_q.data.T).view(hidden_shape).transpose(1, 2) # (b, n_head, s, head_dim)
-        key_states = F.linear(hidden, w_k.data.T).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, s, head_dim)
-        value_states = F.linear(hidden, w_v.data.T).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, s, head_dim)
+        query_states = F.linear(hidden, w_q.data).view(hidden_shape).transpose(1, 2) # (b, n_head, s, head_dim)
+        key_states = F.linear(hidden, w_k.data).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, s, head_dim)
+        value_states = F.linear(hidden, w_v.data).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, s, head_dim)
         
 
         cos, sin = torch.chunk(position_embeddings.data, 2, dim=0)
@@ -393,7 +396,7 @@ class TorchDevice:
         attn_output = attn_output.transpose(1, 2).contiguous()
 
         attn_output = attn_output.reshape(b, s, h).contiguous()
-        attn_output = F.linear(attn_output, w_out.data.T)
+        attn_output = F.linear(attn_output, w_out.data)
 
         # key_states = key_states.reshape(b*n_kv_head, s, head_dim).transpose(0, 1) # (b*n_kv_head, s, head_dim)
         # value_states = value_states.reshape(b*n_kv_head, s, head_dim).transpose(0, 1) # (b*n_kv_head, s, head_dim)
@@ -426,15 +429,18 @@ class TorchDevice:
         scaling = head_dim ** -0.5
         
         # MixtralRMSNorm
+        inputs.data = inputs.data.to(torch.float32)
         variance = inputs.data.pow(2).mean(-1, keepdim=True)
         hidden = inputs.data * torch.rsqrt(variance + config.rms_norm_eps)
         hidden = hidden * w_ln.data
+        hidden = hidden.to(torch.float16)
+        inputs.data = inputs.data.to(torch.float16)
         
         hidden_shape = (b, s, -1, head_dim)
         
-        query_states = F.linear(hidden, w_q.data.T).view(hidden_shape).transpose(1, 2) # (b, n_head, 1, head_dim)
-        key_states = F.linear(hidden, w_k.data.T).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, 1, head_dim)
-        value_states = F.linear(hidden, w_v.data.T).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, 1, head_dim)
+        query_states = F.linear(hidden, w_q.data).view(hidden_shape).transpose(1, 2) # (b, n_head, 1, head_dim)
+        key_states = F.linear(hidden, w_k.data).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, 1, head_dim)
+        value_states = F.linear(hidden, w_v.data).view(hidden_shape).transpose(1, 2) # (b, n_kv_head, 1, head_dim)
 
         cos, sin = torch.chunk(position_embeddings.data, 2, dim=0)
         cos = cos.squeeze(0)
@@ -474,7 +480,7 @@ class TorchDevice:
                 attn_output = attn_output.transpose(1, 2).contiguous()
 
                 attn_output = attn_output.reshape(b, s, h).contiguous()
-                attn_output = F.linear(attn_output, w_out.data.T)
+                attn_output = F.linear(attn_output, w_out.data)
 
         else:  # Mixed device attention
             assert(False)
@@ -769,14 +775,15 @@ class TorchDevice:
     def mixtral_gate(self, inputs, w_gate, w_ln, donate, config: MixtralConfig):
         b, s, h = inputs.shape
         # MixtralRMSNorm
+        inputs.data = inputs.data.to(torch.float32)
         variance = inputs.data.pow(2).mean(-1, keepdim=True)
         hidden = inputs.data * torch.rsqrt(variance + config.rms_norm_eps)
         hidden = hidden * w_ln.data
-
+        hidden.data = hidden.data.to(torch.float16)
         after_norm = hidden
 
         hidden = hidden.view(-1, config.hidden_size)
-        routing_logits = F.linear(hidden, w_gate.data.T) # (b * s, num_experts)
+        routing_logits = F.linear(hidden, w_gate.data) # (b * s, num_experts)
 
         if donate[0]: inputs.delete()
 
@@ -810,8 +817,8 @@ class TorchDevice:
             current_state = inputs.data.view(-1, h)[None, top_x].reshape(-1, h)
 
             # 计算 expert
-            current_hidden_states = F.silu(F.linear(current_state, w1_expert.T)) * F.linear(current_state, w2_expert.T)
-            current_hidden_states = F.linear(current_hidden_states, w3_expert.T)
+            current_hidden_states = F.silu(F.linear(current_state, w1_expert)) * F.linear(current_state, w2_expert)
+            current_hidden_states = F.linear(current_hidden_states, w3_expert)
             current_hidden_states = current_hidden_states * routing_weights[top_x, idx, None]
 
             # However `index_add_` only support torch tensors for indexing so we'll use
@@ -963,7 +970,7 @@ class TorchDisk:
 
 
 # Segment dimension for tensors stored on TorchMixedDevice
-SEG_DIM = 1
+SEG_DIM = 2
 
 class TorchMixedDevice:
     """Manage tensors stored on multiple physical devices."""
@@ -1000,19 +1007,20 @@ class TorchMixedDevice:
                 x.delete()
 
     def init_cache_one_gpu_batch(self, config, task, policy):
-        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+        num_key_value_heads, head_dim, prompt_len, gen_len, gpu_batch_size = (
+            config.num_key_value_heads, config.head_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        # shape = (prompt_len + gen_len - 1, gpu_batch_size * num_key_value_heads, head_dim)
+        shape = (gpu_batch_size, num_key_value_heads, prompt_len + gen_len - 1, head_dim)
 
-        # We have to round to a multiple of `num_head`
+        # We have to round to a multiple of `num_key_value_heads`
         if policy.cache_disk_percent == 0:
-            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_head * num_head
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_key_value_heads * num_key_value_heads
             len_cpu = shape[SEG_DIM]  - len_gpu
             len_disk = 0
         else:
-            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_head * num_head
-            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_head * num_head
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_key_value_heads * num_key_value_heads
+            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_key_value_heads * num_key_value_heads
             len_disk = shape[SEG_DIM] - len_gpu - len_cpu
         lens = [len_gpu, len_cpu, len_disk]
 

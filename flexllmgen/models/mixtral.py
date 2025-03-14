@@ -41,10 +41,47 @@ from flexllmgen.timer import timers
 from flexllmgen.pytorch_backend import DeviceType, general_copy
 
 import os
-from functools import partial
-
+import glob
+import shutil
+import safetensors
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
+
+def download_mixtral_weights(model_name, path):
+    from huggingface_hub import snapshot_download
+    import torch
+
+    print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
+          f"The downloading and cpu loading can take dozens of minutes. "
+          f"If it seems to get stuck, you can monitor the progress by "
+          f"checking the memory usage of this process.")
+
+    if model_name == "mistralai/Mixtral-8x7B-Instruct-v0.1":
+        hf_model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    else:
+        raise ValueError(f"Model {model_name} not supported")
+    
+    # folder = snapshot_download(hf_model_name)
+    folder = "/data1/zzh/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/41bd4c9e7e4fb318ca40e721131d4933966c2cc1"
+    param_files = glob.glob(os.path.join(folder, "*.safetensors"))
+
+    # print("folder: ", folder)
+    # print("param_files: ", param_files)
+
+    if "/" in model_name:
+        model_name = model_name.split("/")[1].lower()
+    path = os.path.join(path, f"{model_name}-np")
+    path = os.path.abspath(os.path.expanduser(path))
+    os.makedirs(path, exist_ok=True)
+
+    # print("path: ", path)
+
+    for param_file in tqdm(param_files, desc="Convert format"):
+        state = safetensors.torch.load_file(param_file)
+        for name, param in tqdm(state.items(), leave=False):
+            param_path = os.path.join(path, name)
+            with open(param_path, "wb") as f:
+                np.save(f, param.to(torch.float16).cpu().detach().numpy())
 
 def get_choice(cur_percent, percents, choices):
     percents = np.cumsum(percents)
@@ -184,7 +221,7 @@ class OutputEmbed:
             # w_ln
             ((h,), dtype, path + "model.norm.weight"),
             # w_token
-            ((h, v), dtype, path + "lm_head.weight"),
+            ((v, h), dtype, path + "lm_head.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -249,11 +286,11 @@ class MixtralAttention:
             # w_q
             ((h, h), dtype, path + f"model.layers.{self.layer_id}.self_attn.q_proj.weight"),
             # w_k
-            ((h, h_kv), dtype, path + f"model.layers.{self.layer_id}.self_attn.k_proj.weight"),
+            ((h_kv, h), dtype, path + f"model.layers.{self.layer_id}.self_attn.k_proj.weight"),
             # w_v
-            ((h, h_kv), dtype, path + f"model.layers.{self.layer_id}.self_attn.v_proj.weight"),
+            ((h_kv, h), dtype, path + f"model.layers.{self.layer_id}.self_attn.v_proj.weight"),
             # w_out
-            ((h, h), dtype, path + f"model.layers.{self.layer_id}.self_attn.out_proj.weight"),
+            ((h, h), dtype, path + f"model.layers.{self.layer_id}.self_attn.o_proj.weight"),
             # w_ln
             ((h,), dtype, path + f"model.layers.{self.layer_id}.input_layernorm.weight"),
         ]
@@ -448,7 +485,7 @@ class MixtralGate:
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.torch_dtype)
         weight_specs = [
-            ((h, self.num_experts), dtype, path + f"model.layers.{self.layer_id}.block_sparse_moe.gate.weight"),
+            ((self.num_experts, h), dtype, path + f"model.layers.{self.layer_id}.block_sparse_moe.gate.weight"),
             ((h,), dtype, path + f"model.layers.{self.layer_id}.post_attention_layernorm.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
@@ -508,9 +545,9 @@ class MixtralSparseMLP:
         weight_specs = []
         for i in range(self.num_experts):
             tmp_path = os.path.join(path, f"model.layers.{self.layer_id}.block_sparse_moe.experts.{i}.")
-            weight_specs.append(((h, inter_h), dtype, tmp_path + "w1.weight"))
-            weight_specs.append(((h, inter_h), dtype, tmp_path + "w2.weight"))
+            weight_specs.append(((inter_h, h), dtype, tmp_path + "w1.weight"))
             weight_specs.append(((inter_h, h), dtype, tmp_path + "w3.weight"))
+            weight_specs.append(((h, inter_h), dtype, tmp_path + "w2.weight"))
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
@@ -763,10 +800,11 @@ class Mixtral:
         expanded_path = os.path.abspath(os.path.expanduser(
             os.path.join(self.path, f"{self.model_name}-np")))
         check_path = os.path.join(expanded_path, "model.embed_tokens.weight")
+        # print(expanded_path)
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
-            download_opt_weights(self.model_name, self.path)
+            download_mixtral_weights(self.model_name, expanded_path)
 
-        self.layers[j].init_weight(self.weight_home[j], expanded_path)
+        self.layers[j].init_weight(self.weight_home[j], expanded_path + "/")
 
     def load_weight(self, i, j, k, overlap=True):
         # Handle corner cases
