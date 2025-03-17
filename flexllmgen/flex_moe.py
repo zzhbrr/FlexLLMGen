@@ -95,7 +95,10 @@ def run_flexllmgen(args):
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
     # Task and policy
-    warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
+    warmup_inputs = get_test_inputs(2, num_prompts, tokenizer)
+    print("warmup_inputs:", warmup_inputs)
+    # with open('/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2.txt', 'w') as f:
+    #     f.write(str(warmup_inputs))
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     gpu = TorchDevice("cuda:0")
@@ -124,7 +127,7 @@ def run_flexllmgen(args):
     # mixtral_config.intermediate_size = 512
     # mixtral_config.num_attention_heads = 8
     # mixtral_config.num_key_value_heads = 4
-    # mixtral_config.num_hidden_layers = 4
+    # mixtral_config.num_hidden_layers = 1
     # mixtral_config.hidden_size = 128
     model_size, cache_size, hidden_size = calc_model_cache_hidden_size(mixtral_config, args.model, num_prompts, prompt_len + gen_len)
     print(f"model size: {model_size/GB:.3f} GB, "
@@ -139,7 +142,7 @@ def run_flexllmgen(args):
         print("warmup - generate")
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose)
-
+        
         print("benchmark - generate")
         timers("generate").reset()
         output_ids = model.generate(

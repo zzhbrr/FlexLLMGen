@@ -11,6 +11,7 @@ from typing import Optional, Union, Tuple, List
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 import numpy as np
 
 from transformers.models.mixtral.modeling_mixtral import MixtralRotaryEmbedding
@@ -240,7 +241,7 @@ class TorchDevice:
         if donate[0]: attention_mask.delete()
         return TorchTensor.create_from_torch(data, self)
     
-    def mixtral_input_embed(self, inputs, attention_mask, w_token, rotary_emb: MixtralRotaryEmbedding, pad_token_id, donate):
+    def mixtral_input_embed(self, inputs, attention_mask, w_token, rotary_emb: MixtralRotaryEmbedding, pad_token_id, donate, config: MixtralConfig):
         # decompress weights
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
@@ -295,13 +296,24 @@ class TorchDevice:
         b, s, h = inputs.data.shape
 
         # MixtralRMSNorm
+        inputs.data = inputs.data.to(torch.float32)
         variance = inputs.data.pow(2).mean(-1, keepdim=True)
         hidden = inputs.data * torch.rsqrt(variance + eps)
         hidden = hidden * w_ln.data
+        hidden = hidden.to(torch.float16)
         if donate[0]: inputs.delete()
 
+        # with open("/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2_final.txt", "w") as f:
+        #     torch.set_printoptions(profile="full")
+        #     torch.set_printoptions(precision=5,sci_mode=False)
+        #     f.write(str(hidden.data))
+        
         # output embedding
         logits = F.linear(hidden, w_token.data)
+        # with open("/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2_logits.txt", "w") as f:
+        #     torch.set_printoptions(profile="full")
+        #     torch.set_printoptions(precision=5,sci_mode=False)
+        #     f.write(str(logits))
         last_token_logits = logits[:,-1,:]
 
         if do_sample and not temperature < 1e-5:
@@ -309,6 +321,7 @@ class TorchDevice:
             ids = torch.multinomial(probs, num_samples=1)
         else:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
+        # print("ids: ", ids)
         return TorchTensor.create_from_torch(ids, self)
 
     def opt_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
@@ -358,6 +371,7 @@ class TorchDevice:
         head_dim, n_head, n_kv_head = config.head_dim, config.num_attention_heads, config.num_key_value_heads
         scaling = head_dim ** -0.5
 
+        residual:torch.Tensor = inputs.data.clone()
         # MixtralRMSNorm
         inputs.data = inputs.data.to(torch.float32)
         variance = inputs.data.pow(2).mean(-1, keepdim=True)
@@ -388,10 +402,13 @@ class TorchDevice:
         causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
         mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
         # shape: (b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        attn_weights = torch.where(mask, attn_weights, torch.finfo(torch.float16).min)
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = F.dropout(attn_weights, p=config.attention_dropout, training=False)
+        # with open("/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2_attention_weights.txt", "w") as f:
+        #     torch.set_printoptions(profile="full")
+        #     f.write(str(attn_weights))
         attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -408,10 +425,15 @@ class TorchDevice:
             key_states = TorchTensor.create_from_torch(key_states, self)
             value_states = TorchTensor.create_from_torch(value_states, self)
         
-        attn_output.add_(inputs.data)
+        attn_output.add_(residual.data)
+
+        # with open("/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2_attention_residual.txt", "w") as f:
+        #     torch.set_printoptions(profile="full")
+        #     f.write(str(residual.data))
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
+        del residual
 
         return TorchTensor.create_from_torch(attn_output, self), key_states, value_states
 
@@ -427,7 +449,8 @@ class TorchDevice:
         b, s, h = inputs.shape # s = 1
         head_dim, n_head, n_kv_head = config.head_dim, config.num_attention_heads, config.num_key_value_heads
         scaling = head_dim ** -0.5
-        
+
+        residual:torch.Tensor = inputs.data.clone()
         # MixtralRMSNorm
         inputs.data = inputs.data.to(torch.float32)
         variance = inputs.data.pow(2).mean(-1, keepdim=True)
@@ -492,10 +515,11 @@ class TorchDevice:
             key_states = TorchTensor.create_from_torch(key_states, self)
             value_states = TorchTensor.create_from_torch(value_states, self)
         
-        attn_output.add_(inputs.data)
+        attn_output.add_(residual.data)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
+        del residual
 
         return TorchTensor.create_from_torch(attn_output, self), key_states, value_states
 

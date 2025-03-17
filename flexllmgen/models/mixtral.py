@@ -195,7 +195,10 @@ class InputEmbed:
         else:
             w_token, _ = weight_read_buf.val
         
-        h, pe = self.compute.mixtral_input_embed(h, mask, w_token, self.rotary_emb, self.pad_token_id, donate)
+        h, pe = self.compute.mixtral_input_embed(h, mask, w_token, self.rotary_emb, self.pad_token_id, donate, self.config)
+        # with open("/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2_inputembed.txt", "w") as f:
+        #     torch.set_printoptions(profile="full")
+        #     f.write(str(h.data))
         hidden.val = (h, pe) # XXX: 这里额外存了一个pe，后面的层的推理需要改改
 
 
@@ -448,20 +451,11 @@ class MixtralAttention:
                 self.policy.attn_sparsity, self.policy.compress_cache, self.policy.comp_cache_config, self.config, k_cache, v_cache)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
-        # if i == 0:  # prefill
-        #     mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-        #     h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
-        #         w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
-        #         self.policy.compress_cache, self.policy.comp_cache_config)
-        #     cache_write_buf.store((new_k_cache, new_v_cache))
-        # else:  # decoding
-        #     mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-        #     (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
-        #     h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
-        #         b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
-        #         k_cache, v_cache, donate, self.policy.attn_sparsity,
-        #         self.policy.compress_cache, self.policy.comp_cache_config)
-        #     cache_write_buf.store((new_k_cache, new_v_cache))
+       # if self.layer_id == 0:
+        #     with open("/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2_attention.txt", "w") as f:
+        #         torch.set_printoptions(profile="full")
+        #         torch.set_printoptions(precision=5,sci_mode=False)
+        #         f.write(str(h.data))
 
         hidden.val = (h, pe)
 
@@ -519,6 +513,13 @@ class MixtralGate:
         (h, pe), donate[0] = hidden.val, False
         pre_norm = h
         after_norm, routing_logits = self.compute.mixtral_gate(h, w_gate, w_ln, donate, self.config)
+
+        # if self.layer_id == 0:
+        #     with open("/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2_routinglogits.txt", "w") as f:
+        #         torch.set_printoptions(profile="full")
+        #         torch.set_printoptions(precision=5,sci_mode=False)
+        #         f.write(str(routing_logits.data))
+        
         hidden.val = (pre_norm, after_norm, routing_logits, pe)
 
 
@@ -607,6 +608,11 @@ class MixtralSparseMLP:
                 w3.append(tmp[cnt + 2][0])
                 cnt += 3
         h = self.compute.mixtral_moe(h, routing_logits, pre_norm, self.topk, self.num_experts, w1, w2, w3, donate)
+        # if self.layer_id == 31:
+        #     with open("/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2_moe.txt", "w") as f:
+        #         torch.set_printoptions(profile="full")
+        #         torch.set_printoptions(precision=5,sci_mode=False)
+        #         f.write(str(h.data))
         hidden.val = (h, pe)
 
 
