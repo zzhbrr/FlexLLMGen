@@ -1013,6 +1013,8 @@ class TorchMixedDevice:
 
         devices = self.base_devices
         tensors = []
+        # print("seg_lengths: ", seg_lengths)
+        # print("seg_points: ", seg_points)
         for i in range(len(devices)):
             seg_len = seg_points[i+1] - seg_points[i]
             if seg_len == 0:
@@ -1021,6 +1023,7 @@ class TorchMixedDevice:
                 seg_shape = shape[:SEG_DIM] + (seg_len,) + shape[SEG_DIM+1:]
                 tensors.append(devices[i].allocate(seg_shape, dtype,
                     pin_memory=pin_memory))
+                # print("seg_shape: ", seg_shape)
 
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            (tensors, seg_points), self, name=name)
@@ -1047,6 +1050,7 @@ class TorchMixedDevice:
             len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_key_value_heads * num_key_value_heads
             len_disk = shape[SEG_DIM] - len_gpu - len_cpu
         lens = [len_gpu, len_cpu, len_disk]
+        print(lens)
 
         pin_memory = False
         k_cache = self.allocate(shape, np.float16,
@@ -1154,6 +1158,8 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
 def cut_indices(indices, start, stop, base=0):
     assert all(x.step is None for x in indices)
     seg = indices[SEG_DIM]
+    if seg.stop <= start:
+        return indices
     return (indices[:SEG_DIM] +
             (slice(max(seg.start, start) - base, min(seg.stop, stop) - base),) +
             indices[SEG_DIM + 1:])

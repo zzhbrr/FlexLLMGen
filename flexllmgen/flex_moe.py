@@ -106,6 +106,9 @@ def run_flexllmgen(args):
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
+    assert args.compress_weight == False, "Not implemented"
+    assert args.compress_cache == False, "Not implemented"
+
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
                     args.percent[0], args.percent[1],
                     args.percent[2], args.percent[3],
@@ -127,7 +130,7 @@ def run_flexllmgen(args):
     # mixtral_config.intermediate_size = 512
     # mixtral_config.num_attention_heads = 8
     # mixtral_config.num_key_value_heads = 4
-    # mixtral_config.num_hidden_layers = 1
+    mixtral_config.num_hidden_layers = 32
     # mixtral_config.hidden_size = 128
     model_size, cache_size, hidden_size = calc_model_cache_hidden_size(mixtral_config, args.model, num_prompts, prompt_len + gen_len)
     print(f"model size: {model_size/GB:.3f} GB, "
@@ -193,7 +196,7 @@ def run_flexllmgen(args):
 
 
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="mixtralai/Mixtral-8x7B-Instruct-v0.1",
+    parser.add_argument("--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1",
         help="The model name.")
     parser.add_argument("--path", type=str, default="/data1/zzh/flexgen_weights",
         help="The path to the model weights. If there are no cached weights, "
@@ -245,3 +248,5 @@ if __name__ == "__main__":
     assert len(args.percent) == 6
 
     run_flexllmgen(args)
+
+# python flex_moe.py --model mistralai/Mixtral-8x7B-Instruct-v0.1 --percent 0 100 0 100 0 100
