@@ -531,12 +531,13 @@ def solve(config, solve_lp, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="facebook/opt-175b")
+    # parser.add_argument("--model", type=str, default="facebook/opt-175b")
+    parser.add_argument("--model", type=str, default="facebook/opt-30b")
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--gpu-mem", type=int, default=15)
-    parser.add_argument("--cpu-mem", type=int, default=200)
-    parser.add_argument("--nvme-mem", type=int, default=1500)
+    parser.add_argument("--cpu-mem", type=int, default=256)
+    parser.add_argument("--nvme-mem", type=int, default=0)
     
     parser.add_argument("--gbs", "--gpu-batch-size", type=int)
     parser.add_argument("--num-gb", "--num-gpu-batches", type=int)

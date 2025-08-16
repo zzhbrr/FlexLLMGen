@@ -70,6 +70,16 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
                           max_length=prompt_len, truncation=True).input_ids
     return input_ids
 
+def tokenize(tokenizer, inputs, max_length):
+    prompts = []
+    for content in inputs:
+        chat_input = [{"role": "user", "content": content}]
+        prompt = tokenizer.apply_chat_template(chat_input, tokenize=False)
+        prompts.append(prompt)
+    
+    input_ids = tokenizer(prompts, padding="max_length", max_length=max_length).input_ids
+    return input_ids
+
 def calc_model_cache_hidden_size(config: MixtralConfig, model_name, batch_size, seq_len):
     # model size
     if model_name == "mistralai/Mixtral-8x7B-Instruct-v0.1":
@@ -84,7 +94,7 @@ def calc_model_cache_hidden_size(config: MixtralConfig, model_name, batch_size, 
 
     return model_size * GB, cache_size, hidden_size
 
-def run_flexllmgen(args):
+def run_flexllmgen(args, input_data):
     print(f"<run_flexllmgen>: args.model: {args.model}")
     if args.model == "mistralai/Mixtral-8x7B-Instruct-v0.1":
         tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1", padding_side="left")
@@ -93,13 +103,16 @@ def run_flexllmgen(args):
         assert False, "Model not supported yet"
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    print(args)
 
     # Task and policy
-    warmup_inputs = get_test_inputs(2, num_prompts, tokenizer)
-    print("warmup_inputs:", warmup_inputs)
+    # warmup_inputs = get_test_inputs(2, num_prompts, tokenizer)
+    # print("warmup_inputs:", warmup_inputs)
     # with open('/home/zzh/llmserving/FlexLLMGen/flexllmgen/tests/output2.txt', 'w') as f:
     #     f.write(str(warmup_inputs))
-    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
+    # inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
+    inputs = tokenize(tokenizer, input_data, args.max_sequence_length)
+    # print(inputs)
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
@@ -143,8 +156,8 @@ def run_flexllmgen(args):
 
     try:
         print("warmup - generate")
-        output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
+        # output_ids = model.generate(
+        #     warmup_inputs, max_new_tokens=1, verbose=args.verbose)
         
         print("benchmark - generate")
         timers("generate").reset()
@@ -209,8 +222,8 @@ def add_parser_arguments(parser):
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown"])
-    parser.add_argument("--gpu-batch-size", type=int, default=4)
-    parser.add_argument("--num-gpu-batches", type=int, default=1)
+    parser.add_argument("--gpu-batch-size", type=int, default=1)
+    parser.add_argument("--num-gpu-batches", type=int, default=4)
     parser.add_argument("--percent", nargs="+", type=int,
         default=[100, 0, 100, 0, 100, 0],
         help="Six numbers. They are "
@@ -238,6 +251,7 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    parser.add_argument("--max-sequence-length", type=int, default=2000)
 
 
 if __name__ == "__main__":
@@ -246,7 +260,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     assert len(args.percent) == 6
+    input_data = ["Hello, how are you?"] * 2 + ["Good morning, I am fine, thank you."] * 2
+    run_flexllmgen(args, input_data)
 
-    run_flexllmgen(args)
-
-# python flex_moe.py --model mistralai/Mixtral-8x7B-Instruct-v0.1 --percent 0 100 0 100 0 100
+# python flex_moe.py --model mistralai/Mixtral-8x7B-Instruct-v0.1 --percent 0 100 0 100 0 100 --max-sequence-length 100 --log-file "/home/zzh/llmserving/FlexLLMGen/logs/a.log"

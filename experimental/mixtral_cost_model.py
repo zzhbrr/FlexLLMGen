@@ -40,7 +40,7 @@ from flexllmgen.policy import Policy
 from flexllmgen.utils import GB, T
 
 alpha_g = 0.8
-alpha_c = 0.8
+alpha_c = 0.9
 alpha_n = 0.8
 
 
@@ -61,7 +61,7 @@ class MixtralCostModelConfig:
     num_experts_per_tok: int = 2
     
     gmem: int = 24 * GB
-    cmem: int = 486 * GB # 实际上会用到80%的CPU Memory
+    cmem: int = 256 * GB # 实际上会用到80%的CPU Memory
     nmem: int = 0 * GB
 
     # hardware constants
@@ -227,14 +227,15 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
                      + 2 * s * h1 * bls * (hc + hn))
 
     # gtocp = (cache_gtocp + hidden_gtocp) / gtoc_bdw
-    prob += gtocp == (1 / gtoc_bdw_cache) * (4 * (s + 1) * h1 * bls * (cc + cn)) \
+    # KV cache size: 4 * batch_size * seq_len * num_key_value_heads * head_dim (Key + Value, fp16)
+    prob += gtocp == (1 / gtoc_bdw_cache) * (4 * (s + 1) * nkv * head_dim * bls * (cc + cn)) \
                    + (1 / gtoc_bdw_hidden) * 2 * s * h1 * bls * (hc + hn)
 
     # dtocp = (weight_dtocp + hidden_dtocp) / dtoc_bdw
     prob += dtocp == (1 / dtoc_bdw) * (wi * wn + 2 * s * h1 * bls * hn)
 
     # ctodp = (cache_ctodp + hidden_ctodp) / ctod_bdw
-    prob += ctodp == (1 / ctod_bdw_cache_p) * 4 * bls * (s + 1) * h1 * cn \
+    prob += ctodp == (1 / ctod_bdw_cache_p) * 4 * bls * (s + 1) * nkv * head_dim * cn \
                    + (1 / ctod_bdw_hidden_p) * 2 * s * h1 * bls * hn
 
     # compp = gpu_compp (adjusted for MoE)
@@ -262,12 +263,12 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
     prob += gtocg == (1 / gtoc_bdw_hidden) * 2 * h1 * bls * (hc + hn)
 
     # dtocg = (cache_dtocg + weight_dtocg + hidden_dtocg) / dtoc_bdw
-    prob += dtocg == (1 / dtoc_bdw) * (4 * bls * (s + n / 2) * h1 * cn
+    prob += dtocg == (1 / dtoc_bdw) * (4 * bls * (s + n / 2) * nkv * head_dim * cn
                                        + 2 * h1 * bls * hn) \
                      + (1 / (dtoc_bdw * 0.95)) * wi * wn 
 
     # ctodg = (cache_ctodg + hidden_ctodg) / ctod_bdw
-    prob += ctodg == (1 / ctod_bdw_g) * (4 * bls * h1 * cn
+    prob += ctodg == (1 / ctod_bdw_g) * (4 * bls * nkv * head_dim * cn
                      + 2 * h1 * bls * hn)
 
     # compg = gpu_compg + cpu_compg (adjusted for MoE)
@@ -303,7 +304,7 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
     nvme_peak = pulp.LpVariable("nvme_peak", lowBound=0)
     
     ## GPU peak memory constaints
-    prob += gpu_home_p == wi * l * wg + 2 * s * h1 * bls * hg + 4 * (s + n) * h1 * bls * l * cg
+    prob += gpu_home_p == wi * l * wg + 2 * s * h1 * bls * hg + 4 * (s + n) * nkv * head_dim * bls * l * cg
     
     # Intermediate memory for prefill (adjusted for MoE)
     # Attention intermediate: qkv, attention scores, output
@@ -319,7 +320,7 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
                      + interp
     prob += gpu_home_p + gpu_w_p <= gmem
 
-    prob += gpu_home_g == wi * l * wg + 2 * h1 * bls * hg + 4 * (s + n) * h1 * bls * l * cg
+    prob += gpu_home_g == wi * l * wg + 2 * h1 * bls * hg + 4 * (s + n) * nkv * head_dim * bls * l * cg
     
     # Intermediate memory for generation (adjusted for MoE)
     attn_inter_g = 8 * gbs * h1 + gbs * (2 * h1 + 2 * (s + n) * h1 + 2 * nh * (s + n)) * cg \
@@ -337,16 +338,16 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
     prob += gpu_home_g + gpu_w_g <= gmem
 
     ## CPU peak memory constraints
-    prob += cpu_home_p == wi * l * wc + 2 * s * h1 * bls * hc + 4 * s * h1 * bls * l * cc
+    prob += cpu_home_p == wi * l * wc + 2 * s * h1 * bls * hc + 4 * s * nkv * head_dim * bls * l * cc
     prob += cpu_w_p == wi * (1 - wg) + 2 * s * h1 * gbs * (1 - hg)
     prob += cpu_home_p + cpu_w_p <= cmem
 
-    prob += cpu_home_g == wi * l * wc + 2 * h1 * bls * hc + 4 * (s + n) * h1 * bls * l * cc
-    prob += cpu_w_g == wi * wn + 4 * h1 * gbs * hn + 8 * (s + n) * h1 * gbs * cn + 2 * nh * (s + n) * gbs + 2 * h1 * gbs
+    prob += cpu_home_g == wi * l * wc + 2 * h1 * bls * hc + 4 * (s + n) * nkv * head_dim * bls * l * cc
+    prob += cpu_w_g == wi * wn + 4 * h1 * gbs * hn + 8 * (s + n) * nkv * head_dim * gbs * cn + 2 * nh * (s + n) * gbs + 2 * h1 * gbs
     prob += cpu_home_g + cpu_w_g <= cmem
 
     ## NVMe peak memory constraints
-    prob += nvme_peak == wi * l * wn + 2 * s * h1 * bls * hn + 4 * (s + n) * h1 * bls  * l * cn
+    prob += nvme_peak == wi * l * wn + 2 * s * h1 * bls * hn + 4 * (s + n) * nkv * head_dim * bls * l * cn
     prob += nvme_peak <= nmem
 
     # ------------ Finish add constraints ---------------
@@ -387,7 +388,7 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
               f"dtocg = {pulp.value(dtocg):.4f} s  "
               f"ctodg = {pulp.value(ctodg):.4f} s  "
               f"compg = {pulp.value(compg):.4f} s")
-        print(f"cache dtocg: {4 * bls * (s + n / 2) * h1 * pulp.value(cn) / dtoc_bdw:.2f}  "
+        print(f"cache dtocg: {4 * bls * (s + n / 2) * nkv * head_dim * pulp.value(cn) / dtoc_bdw:.2f}  "
               f"weights dtocg: {wi * pulp.value(wn) / dtoc_bdw:.2f}")
         print(f"Tgen = {pulp.value(Tgen):.3f} s")
         print(f"Tgen * (n-1) * l: "
@@ -515,8 +516,8 @@ if __name__ == "__main__":
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--gpu-mem", type=int, default=15)
-    parser.add_argument("--cpu-mem", type=int, default=200)
-    parser.add_argument("--nvme-mem", type=int, default=1500)
+    parser.add_argument("--cpu-mem", type=int, default=256)
+    parser.add_argument("--nvme-mem", type=int, default=0)
     
     parser.add_argument("--gbs", "--gpu-batch-size", type=int)
     parser.add_argument("--num-gb", "--num-gpu-batches", type=int)

@@ -24,6 +24,7 @@
 """Inference-only Mixtral model."""
 from typing import Iterable, Optional, Set, Tuple, Union, List
 
+import time
 import torch
 from torch import nn
 from transformers import MixtralConfig
@@ -419,6 +420,7 @@ class MixtralAttention:
             indices = (slice(0, k_new.shape[0]),
                        slice(0, k_new.shape[1]),
                        slice(pos - k_new.shape[2], pos))
+        # print("indices: ", indices)
 
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
@@ -1054,6 +1056,7 @@ class Mixtral:
         # Init cache
         self.set_task(task)
         for j in range(num_layers):
+            print(f"Prefill Layer: {j}/{num_layers}")
             for k in range(num_gpu_batches):
                 self.init_cache(j, k)
         if self.policy.cpu_cache_compute:
@@ -1222,6 +1225,7 @@ class Mixtral:
 
         # Generate
         for i in range(self.execute_gen_len):
+            begin_time = time.time()
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
@@ -1235,6 +1239,7 @@ class Mixtral:
                     self.store_cache(i, j, k-1)
                     self.sync()
             timers("generate").stop()
+            print("Decoding Step: ", i, ", Time: ", time.time() - begin_time)
 
         # Epilogue
         self.store_hidden(

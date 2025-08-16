@@ -1,7 +1,7 @@
 import dataclasses
 from flexllmgen.compression import CompressionConfig
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass()
 class Policy:
     gpu_batch_size: int
     num_gpu_batches: int
